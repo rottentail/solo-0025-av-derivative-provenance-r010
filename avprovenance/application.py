@@ -8,6 +8,7 @@ from typing import Any
 from .errors import (
     ApplicationError,
     IntegrityMismatch,
+    PersistenceFailure,
     PlanInvalid,
     RenditionNotCompleted,
 )
@@ -17,15 +18,16 @@ from .models import (
     ProvenanceEdge,
     Rendition,
 )
-from .media import inspect_media
+from .media import inspect_media, inspect_media_file
 from .renditions import (
     compile_plan,
-    execute_plan,
-    reproduce_output,
+    execute_plan_to_target,
+    reproduce_output_to_target,
 )
 from .serialization import (
     deep_copy,
     new_identifier,
+    sha256_file,
     sha256_hex,
     utc_now,
 )
@@ -49,9 +51,6 @@ class MediaProvenanceApplication:
         self.state_file = JsonStateFile(self.data_dir / "state.json")
         self.repository = ProvenanceRepository(self.state_file)
 
-    def _asset_bytes(self, asset: MediaAsset) -> bytes:
-        return self.content_files.read(asset.content_key)
-
     def _rendition_view(self, rendition: Rendition) -> dict[str, Any]:
         value = rendition.to_dict()
         if rendition.output_asset_id:
@@ -72,12 +71,30 @@ class MediaProvenanceApplication:
         content_key = self.content_files.key_for_digest(digest)
         existed = self.content_files.exists(content_key)
         self.content_files.write(data, digest)
+        return self._commit_asset(
+            safe_name,
+            descriptor,
+            digest,
+            len(data),
+            content_key,
+            existed,
+        )
+
+    def _commit_asset(
+        self,
+        safe_name: str,
+        descriptor,
+        digest: str,
+        size_bytes: int,
+        content_key: str,
+        existed: bool,
+    ) -> dict[str, Any]:
         asset = MediaAsset(
             id=new_identifier("asset"),
             filename=safe_name,
             kind=descriptor.kind,
             sha256=digest,
-            size_bytes=len(data),
+            size_bytes=size_bytes,
             content_key=content_key,
             descriptor=descriptor,
             created_at=utc_now(),
@@ -89,6 +106,32 @@ class MediaProvenanceApplication:
                 self.content_files.remove(content_key)
             raise
         return persisted.to_public_dict()
+
+    def ingest_asset_from_file(
+        self,
+        filename: Any,
+        payload_path: Path,
+    ) -> dict[str, Any]:
+        """Persist an already-spooled upload without loading it into memory.
+
+        The caller owns *payload_path* and removes it if it is still present
+        after this call returns or raises.
+        """
+
+        safe_name = validate_filename(filename)
+        descriptor = inspect_media_file(payload_path)
+        digest, size_bytes = sha256_file(payload_path)
+        content_key = self.content_files.key_for_digest(digest)
+        existed = self.content_files.exists(content_key)
+        self.content_files.commit_temporary(payload_path, digest)
+        return self._commit_asset(
+            safe_name,
+            descriptor,
+            digest,
+            size_bytes,
+            content_key,
+            existed,
+        )
 
     def get_asset(self, asset_id: str) -> dict[str, Any]:
         return self.repository.get_asset(asset_id).to_public_dict()
@@ -152,24 +195,38 @@ class MediaProvenanceApplication:
         self.repository.create_rendition(rendition)
         self.repository.transition_rendition(rendition.id, "running")
 
+        primary_path: Path | None = None
+        secondary_path: Path | None = None
+        output_handle = None
+        output_temp_path: Path | None = None
         try:
-            primary_bytes = self._asset_bytes(primary)
-            secondary_bytes = self._asset_bytes(secondary) if secondary else None
-            outcome = execute_plan(
-                primary_bytes,
-                plan.operations,
-                secondary_bytes,
+            primary_path = self.content_files.path_for_key(primary.content_key)
+            secondary_path = (
+                self.content_files.path_for_key(secondary.content_key)
+                if secondary
+                else None
             )
-            output_digest = sha256_hex(outcome.data)
+            output_handle, output_temp_path = self.content_files.open_temporary()
+            outcome = execute_plan_to_target(
+                primary_path,
+                plan.operations,
+                output_handle,
+                secondary_path,
+            )
+            output_handle.flush()
+            output_handle.close()
+            output_handle = None
+            output_digest, output_size = sha256_file(output_temp_path)
             output_key = self.content_files.key_for_digest(output_digest)
             output_existed = self.content_files.exists(output_key)
-            self.content_files.write(outcome.data, output_digest)
+            self.content_files.commit_temporary(output_temp_path, output_digest)
+            output_temp_path = None
             output_asset = MediaAsset(
                 id=new_identifier("asset"),
                 filename=output_name,
                 kind=outcome.descriptor.kind,
                 sha256=output_digest,
-                size_bytes=len(outcome.data),
+                size_bytes=output_size,
                 content_key=output_key,
                 descriptor=outcome.descriptor,
                 created_at=utc_now(),
@@ -220,6 +277,14 @@ class MediaProvenanceApplication:
                 message="The rendition failed before completion.",
                 status=409,
             ) from exc
+        finally:
+            if output_handle is not None:
+                try:
+                    output_handle.close()
+                except OSError:
+                    pass
+            if output_temp_path is not None:
+                self.content_files.discard_temporary(output_temp_path)
 
     def get_rendition(self, rendition_id: str) -> dict[str, Any]:
         return self._rendition_view(self.repository.get_rendition(rendition_id))
@@ -288,12 +353,29 @@ class MediaProvenanceApplication:
             self._finish_mismatch(audit, "provenance_unavailable")
 
         expected_descriptor = output_asset.descriptor.to_dict()
+        recorded_output_path: Path | None = None
+        primary_path: Path | None = None
+        secondary_path: Path | None = None
+        reproduction_temp_path: Path | None = None
         try:
-            recorded_output = self._asset_bytes(output_asset)
-            primary_bytes = self._asset_bytes(primary_asset)
-            secondary_bytes = (
-                self._asset_bytes(secondary_asset) if secondary_asset else None
+            recorded_output_path = self.content_files.path_for_key(
+                output_asset.content_key
             )
+            primary_path = self.content_files.path_for_key(
+                primary_asset.content_key
+            )
+            secondary_path = (
+                self.content_files.path_for_key(secondary_asset.content_key)
+                if secondary_asset
+                else None
+            )
+            for path in (
+                recorded_output_path,
+                primary_path,
+                secondary_path,
+            ):
+                if path is not None and not path.is_file():
+                    raise PersistenceFailure("A referenced media file is missing.")
         except ApplicationError:
             self._finish_mismatch(
                 audit,
@@ -324,13 +406,29 @@ class MediaProvenanceApplication:
                 expected_descriptor=expected_descriptor,
             )
 
-        outcome = reproduce_output(
-            output_asset=output_asset,
-            recorded_output_bytes=recorded_output,
-            primary_bytes=primary_bytes,
-            operations=deep_copy(rendition.operations),
-            secondary_bytes=secondary_bytes,
-        )
+        try:
+            reproduction_handle, reproduction_temp_path = (
+                self.content_files.open_temporary()
+            )
+            reproduction_handle.close()
+            outcome = reproduce_output_to_target(
+                output_asset=output_asset,
+                recorded_output_path=recorded_output_path,
+                primary_path=primary_path,
+                operations=deep_copy(rendition.operations),
+                target_path=reproduction_temp_path,
+                secondary_path=secondary_path,
+            )
+        except ApplicationError:
+            self._finish_mismatch(
+                audit,
+                "source_or_output_unavailable",
+                expected_digest=output_asset.sha256,
+                expected_descriptor=expected_descriptor,
+            )
+        finally:
+            if reproduction_temp_path is not None:
+                self.content_files.discard_temporary(reproduction_temp_path)
         finished = self.repository.settle_integrity_audit(
             audit.id,
             status=outcome.status,

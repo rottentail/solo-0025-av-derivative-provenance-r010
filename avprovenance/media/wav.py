@@ -7,6 +7,7 @@ import io
 import sys
 import wave
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable
 
 from ..errors import UnsupportedMedia
@@ -31,6 +32,17 @@ def _open_reader(data: bytes) -> wave.Wave_read:
     try:
         reader = wave.open(io.BytesIO(data), "rb")
     except (EOFError, wave.Error) as exc:
+        raise UnsupportedMedia(
+            "The audio payload is not a readable RIFF/WAVE file.",
+            details={"reason": str(exc)},
+        ) from exc
+    return reader
+
+
+def _open_file_reader(path: Path) -> wave.Wave_read:
+    try:
+        reader = wave.open(str(path), "rb")
+    except (EOFError, wave.Error, OSError) as exc:
         raise UnsupportedMedia(
             "The audio payload is not a readable RIFF/WAVE file.",
             details={"reason": str(exc)},
@@ -66,25 +78,40 @@ def _validate_params(reader: wave.Wave_read) -> None:
         raise UnsupportedMedia("WAV input has no sample frames.")
 
 
+def _descriptor_from_reader(reader: wave.Wave_read) -> MediaDescriptor:
+    sample_rate = reader.getframerate()
+    frame_count = reader.getnframes()
+    channels = reader.getnchannels()
+    return MediaDescriptor(
+        kind="audio",
+        mime_type="audio/wav",
+        container="wav",
+        properties={
+            "codec": "pcm_s16le",
+            "sample_rate": sample_rate,
+            "channels": channels,
+            "frame_count": frame_count,
+            "duration_seconds": round(frame_count / sample_rate, 9),
+        },
+    )
+
+
 def inspect_wav(data: bytes) -> MediaDescriptor:
     reader = _open_reader(data)
     try:
         _validate_params(reader)
-        sample_rate = reader.getframerate()
-        frame_count = reader.getnframes()
-        channels = reader.getnchannels()
-        return MediaDescriptor(
-            kind="audio",
-            mime_type="audio/wav",
-            container="wav",
-            properties={
-                "codec": "pcm_s16le",
-                "sample_rate": sample_rate,
-                "channels": channels,
-                "frame_count": frame_count,
-                "duration_seconds": round(frame_count / sample_rate, 9),
-            },
-        )
+        return _descriptor_from_reader(reader)
+    finally:
+        reader.close()
+
+
+def inspect_wav_file(path: Path) -> MediaDescriptor:
+    """Probe WAV geometry from the file header without reading sample data."""
+
+    reader = _open_file_reader(path)
+    try:
+        _validate_params(reader)
+        return _descriptor_from_reader(reader)
     finally:
         reader.close()
 

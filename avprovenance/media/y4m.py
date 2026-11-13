@@ -1,14 +1,24 @@
-"""Planar YUV4MPEG2 parsing and serialization for bounded C420 media."""
+"""Planar YUV4MPEG2 parsing and serialization for bounded C420 media.
+
+The streaming helpers in this module never retain decoded frames.  A caller
+can scan a source to learn its descriptor with a constant amount of working
+memory, then re-read it one frame at a time while performing byte operations.
+The clip based helpers remain available for small in-memory callers and are
+used by the compatibility render path.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import BinaryIO, Iterator, Union
 
 from ..errors import UnsupportedMedia
 from ..models import MediaDescriptor
 
 
 SUPPORTED_PIXEL_FORMATS = {"C420", "C420jpeg", "C420mpeg2", "C420p"}
+MAX_FRAMES = 240
+_SKIP_CHUNK_BYTES = 64 * 1024
 
 
 @dataclass(frozen=True)
@@ -39,6 +49,39 @@ class Y4mClip:
     @property
     def chroma_height(self) -> int:
         return self.height // 2
+
+
+@dataclass(frozen=True)
+class Y4mStreamInfo:
+    """Header metadata plus the validated frame count of a Y4M source."""
+
+    width: int
+    height: int
+    rate_numerator: int
+    rate_denominator: int
+    interlace: str
+    pixel_format: str
+    frame_count: int
+
+    @property
+    def chroma_width(self) -> int:
+        return self.width // 2
+
+    @property
+    def chroma_height(self) -> int:
+        return self.height // 2
+
+    @property
+    def luma_plane_size(self) -> int:
+        return self.width * self.height
+
+    @property
+    def chroma_plane_size(self) -> int:
+        return self.chroma_width * self.chroma_height
+
+    @property
+    def frame_size(self) -> int:
+        return self.luma_plane_size + self.chroma_plane_size * 2
 
 
 def _read_line(data: bytes, position: int) -> tuple[str, int]:
@@ -113,15 +156,207 @@ def _validate_header(values: dict[str, str | int]) -> None:
         )
 
 
+def _validated_header(line: str) -> dict[str, str | int]:
+    try:
+        header = _parse_header(line)
+        _validate_header(header)
+    except ValueError as exc:
+        raise UnsupportedMedia("A Y4M numeric header field is malformed.") from exc
+    return header
+
+
+class _ByteCursor:
+    """Cursor over an immutable bytes payload that never copies frame data."""
+
+    __slots__ = ("_data", "_position")
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._position = 0
+
+    def readline(self) -> bytes | None:
+        if self._position >= len(self._data):
+            return None
+        newline = self._data.find(b"\n", self._position)
+        if newline < 0:
+            raise UnsupportedMedia("Y4M stream ended inside a header line.")
+        raw = self._data[self._position : newline + 1]
+        self._position = newline + 1
+        return raw
+
+    def take(self, size: int) -> bytes:
+        end = self._position + size
+        if end > len(self._data):
+            raise UnsupportedMedia("A Y4M frame payload is truncated.")
+        chunk = self._data[self._position : end]
+        self._position = end
+        return chunk
+
+    def skip(self, size: int) -> None:
+        end = self._position + size
+        if end > len(self._data):
+            raise UnsupportedMedia("A Y4M frame payload is truncated.")
+        self._position = end
+
+
+class _StreamCursor:
+    """Cursor over a binary file object using a fixed-size read buffer."""
+
+    __slots__ = ("_stream",)
+
+    def __init__(self, stream: BinaryIO) -> None:
+        self._stream = stream
+
+    def readline(self) -> bytes | None:
+        raw = self._stream.readline()
+        if not raw:
+            return None
+        if not raw.endswith(b"\n"):
+            raise UnsupportedMedia("Y4M stream ended inside a header line.")
+        return raw
+
+    def take(self, size: int) -> bytes:
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining:
+            chunk = self._stream.read(min(remaining, _SKIP_CHUNK_BYTES))
+            if not chunk:
+                raise UnsupportedMedia("A Y4M frame payload is truncated.")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def skip(self, size: int) -> None:
+        remaining = size
+        while remaining:
+            chunk = self._stream.read(min(remaining, _SKIP_CHUNK_BYTES))
+            if not chunk:
+                raise UnsupportedMedia("A Y4M frame payload is truncated.")
+            remaining -= len(chunk)
+
+
+Cursor = Union[_ByteCursor, _StreamCursor]
+Source = Union[bytes, bytearray, memoryview, BinaryIO]
+
+
+def _make_cursor(source: Source) -> Cursor:
+    if isinstance(source, bytes):
+        return _ByteCursor(source)
+    if isinstance(source, (bytearray, memoryview)):
+        return _ByteCursor(bytes(source))
+    readline = getattr(source, "readline", None)
+    if readline is None:
+        raise TypeError("A Y4M source must be bytes or a binary stream.")
+    return _StreamCursor(source)
+
+
+def _read_header_line(cursor: Cursor) -> str | None:
+    raw = cursor.readline()
+    if raw is None:
+        return None
+    line = raw[:-1]
+    if line.endswith(b"\r"):
+        line = line[:-1]
+    try:
+        return line.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise UnsupportedMedia("Y4M header lines must be ASCII.") from exc
+
+
+def _info_from_header(
+    header: dict[str, str | int],
+    frame_count: int,
+) -> Y4mStreamInfo:
+    return Y4mStreamInfo(
+        width=int(header["width"]),
+        height=int(header["height"]),
+        rate_numerator=int(header["rate_numerator"]),
+        rate_denominator=int(header["rate_denominator"]),
+        interlace=str(header["interlace"]),
+        pixel_format=str(header["pixel_format"]),
+        frame_count=frame_count,
+    )
+
+
+def scan_y4m(source: Source) -> Y4mStreamInfo:
+    """Validate a Y4M source and return its geometry without retaining frames."""
+
+    cursor = _make_cursor(source)
+    first = _read_header_line(cursor)
+    if first is None or not first.startswith("YUV4MPEG2"):
+        raise UnsupportedMedia("The payload is not a Y4M stream.")
+    header = _validated_header(first)
+    info = _info_from_header(header, 0)
+    frame_size = info.frame_size
+
+    frame_count = 0
+    while True:
+        line = _read_header_line(cursor)
+        if line is None:
+            break
+        if not line.startswith("FRAME"):
+            raise UnsupportedMedia("A Y4M frame header is missing.")
+        cursor.skip(frame_size)
+        frame_count += 1
+        if frame_count > MAX_FRAMES:
+            raise UnsupportedMedia("Y4M frame count exceeds the supported bound.")
+
+    if not frame_count:
+        raise UnsupportedMedia("Y4M stream contains no frames.")
+    return _info_from_header(header, frame_count)
+
+
+def iter_y4m_frames(
+    source: Source,
+    info: Y4mStreamInfo | None = None,
+) -> Iterator[Y4mFrame]:
+    """Yield one decoded frame at a time, retaining only the current frame."""
+
+    cursor = _make_cursor(source)
+    first = _read_header_line(cursor)
+    if first is None or not first.startswith("YUV4MPEG2"):
+        raise UnsupportedMedia("The payload is not a Y4M stream.")
+    header = _validated_header(first)
+    current = _info_from_header(header, 0)
+    if info is not None and (
+        info.width != current.width
+        or info.height != current.height
+    ):
+        raise UnsupportedMedia("The Y4M geometry changed during processing.")
+
+    frame_size = current.frame_size
+    luma_size = current.luma_plane_size
+    chroma_size = current.chroma_plane_size
+    frame_count = 0
+    while True:
+        line = _read_header_line(cursor)
+        if line is None:
+            break
+        if not line.startswith("FRAME"):
+            raise UnsupportedMedia("A Y4M frame header is missing.")
+        payload = cursor.take(frame_size)
+        frame_count += 1
+        if frame_count > MAX_FRAMES:
+            raise UnsupportedMedia("Y4M frame count exceeds the supported bound.")
+        if info is not None and frame_count > info.frame_count:
+            raise UnsupportedMedia("The Y4M frame count changed during processing.")
+        yield Y4mFrame(
+            y_plane=payload[:luma_size],
+            u_plane=payload[luma_size : luma_size + chroma_size],
+            v_plane=payload[luma_size + chroma_size :],
+        )
+
+    if not frame_count:
+        raise UnsupportedMedia("Y4M stream contains no frames.")
+    if info is not None and frame_count != info.frame_count:
+        raise UnsupportedMedia("The Y4M frame count changed during processing.")
+
+
 def decode_y4m(data: bytes) -> Y4mClip:
     if not data.startswith(b"YUV4MPEG2"):
         raise UnsupportedMedia("The payload is not a Y4M stream.")
     header_line, position = _read_line(data, 0)
-    try:
-        header = _parse_header(header_line)
-        _validate_header(header)
-    except ValueError as exc:
-        raise UnsupportedMedia("A Y4M numeric header field is malformed.") from exc
+    header = _validated_header(header_line)
 
     width = int(header["width"])
     height = int(header["height"])
@@ -149,7 +384,7 @@ def decode_y4m(data: bytes) -> Y4mClip:
             )
         )
         position = end
-        if len(frames) > 240:
+        if len(frames) > MAX_FRAMES:
             raise UnsupportedMedia("Y4M frame count exceeds the supported bound.")
 
     if not frames:
@@ -165,28 +400,31 @@ def decode_y4m(data: bytes) -> Y4mClip:
     )
 
 
-def inspect_y4m(data: bytes) -> MediaDescriptor:
-    clip = decode_y4m(data)
+def descriptor_for_y4m(info: Y4mStreamInfo) -> MediaDescriptor:
     return MediaDescriptor(
         kind="video",
         mime_type="video/x-yuv4mpeg2",
         container="y4m",
         properties={
-            "width": clip.width,
-            "height": clip.height,
-            "frame_count": clip.frame_count,
-            "rate_numerator": clip.rate_numerator,
-            "rate_denominator": clip.rate_denominator,
-            "interlace": clip.interlace,
-            "pixel_format": clip.pixel_format,
+            "width": info.width,
+            "height": info.height,
+            "frame_count": info.frame_count,
+            "rate_numerator": info.rate_numerator,
+            "rate_denominator": info.rate_denominator,
+            "interlace": info.interlace,
+            "pixel_format": info.pixel_format,
             "duration_seconds": round(
-                clip.frame_count
-                * clip.rate_denominator
-                / clip.rate_numerator,
+                info.frame_count
+                * info.rate_denominator
+                / info.rate_numerator,
                 9,
             ),
         },
     )
+
+
+def inspect_y4m(data: bytes) -> MediaDescriptor:
+    return descriptor_for_y4m(scan_y4m(data))
 
 
 def encode_y4m(clip: Y4mClip) -> bytes:
@@ -205,3 +443,22 @@ def encode_y4m(clip: Y4mClip) -> bytes:
         parts.append(frame.u_plane)
         parts.append(frame.v_plane)
     return b"".join(parts)
+
+
+def encode_y4m_header(
+    *,
+    width: int,
+    height: int,
+    rate_numerator: int,
+    rate_denominator: int,
+    interlace: str,
+    pixel_format: str,
+) -> bytes:
+    """Return the canonical header used by :func:`encode_y4m`."""
+
+    return (
+        "YUV4MPEG2 "
+        f"W{width} H{height} "
+        f"F{rate_numerator}:{rate_denominator} "
+        f"I{interlace} {pixel_format}\n"
+    ).encode("ascii")

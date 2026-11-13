@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import math
 import re
 from pathlib import PurePath
@@ -54,30 +52,6 @@ def validate_filename(value: Any) -> str:
     if filename in {".", ".."}:
         raise ValidationFailure("filename is not a usable media name.")
     return filename
-
-
-def decode_media_payload(value: Any) -> bytes:
-    encoded = require_string(
-        value,
-        "data_base64",
-        minimum=4,
-        maximum=MAX_HTTP_BODY_BYTES,
-    )
-    try:
-        data = base64.b64decode(encoded, validate=True)
-    except (ValueError, binascii.Error) as exc:
-        raise ValidationFailure("data_base64 is not strict base64.") from exc
-    if not data:
-        raise ValidationFailure("data_base64 decoded to an empty payload.")
-    if len(data) > MAX_MEDIA_BYTES:
-        raise ValidationFailure(
-            "decoded media exceeds the payload budget.",
-            details={
-                "size_bytes": len(data),
-                "max_bytes": MAX_MEDIA_BYTES,
-            },
-        )
-    return data
 
 
 def require_number(

@@ -201,6 +201,32 @@ python3 scripts/workflow_checks.py verify-reproduction
 Each check starts a temporary HTTP server, generates media bytes in memory,
 exercises the public endpoints, and shuts the server down.
 
+## Bounded-memory processing
+
+Media work runs in a fixed working set instead of a canvas proportional to
+clip length:
+
+- Upload bodies are parsed incrementally. The base64 payload is decoded in
+  chunks straight into a spool file, so neither the encoded nor the decoded
+  bytes are held in memory.
+- Y4M probes scan header and frame boundaries from a stream. Renditions and
+  integrity checks re-read the source one frame at a time, apply crop, luma
+  offset, and mirror with per-plane striding, and write each transformed frame
+  to the output immediately.
+- Recorded and reproduced outputs are compared by streaming SHA-256, not by
+  loading either file.
+- Outputs publish only after the whole source has been validated. A source
+  that turns out to be truncated or malformed late in the stream fails the
+  rendition, leaves no completed output asset, no provenance edge, and removes
+  its temporary files.
+
+The per-frame working set is at most a few frames of planar C420 data, so a
+near-budget 1920x1080 clip costs the same regardless of whether it holds two
+frames or eight. `python3 scripts/memory_evidence.py` measures peak RSS across
+frame counts, asserts flat scaling, and checks that streamed output is
+byte-identical to the previous clip-at-a-time algorithm on a legal payload
+within 10 percent of the media budget.
+
 ## Environment
 
 No environment variables are required. Runtime choices use `--host`, `--port`,

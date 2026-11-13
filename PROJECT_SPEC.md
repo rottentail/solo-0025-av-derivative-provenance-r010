@@ -209,6 +209,29 @@ All numeric bounds are validated before state is queued. Processing functions
 also re-check data-dependent constraints so malformed persisted plans cannot
 turn into partial output.
 
+## Working memory budget
+
+Video derivation must not allocate memory proportional to clip length:
+
+- Uploads are parsed incrementally and decoded into a spool file in chunks.
+- Y4M inspection scans frame boundaries without decoding planes.
+- Rendition and integrity replay read one frame at a time; crop, luma offset,
+  and mirror are expressed as plane striding and a byte translation table, so
+  only the current frame plus one transformed frame is resident.
+- Recorded output, reproduced output, and uploads are hashed from files with a
+  fixed read buffer.
+
+Consequences:
+
+- Peak memory is a function of frame geometry, not frame count.
+- Composed operations keep their original semantics: trims index the clip as
+  it exists at that point in the plan, crops compose, luma offsets apply one
+  translated plane each in plan order with per-step saturation, and mirrors
+  compose to identity.
+- The source is validated before any output is published. Late truncation or
+  malformed trailing bytes fail the rendition with `RENDER_FAILED`, leave no
+  output asset and no provenance edge, and discard temporary files.
+
 ## Modules
 
 | Module ID | Path | Responsibility |
@@ -267,11 +290,18 @@ python3 -m compileall -q avprovenance scripts
 python3 scripts/workflow_checks.py ingest-media-asset
 python3 scripts/workflow_checks.py execute-rendition
 python3 scripts/workflow_checks.py verify-reproduction
+python3 scripts/memory_evidence.py
 ```
 
 The checks start an ephemeral HTTP server, generate bounded media bytes in
 memory, call the public endpoints, and assert observable state. They do not
 require network access or external media programs.
+
+`memory_evidence.py` drives legal near-budget 1920x1080 Y4M sources through
+upload, rendition, and integrity check while recording the pipeline's own peak
+resident set size. It asserts that peak memory stays flat as the frame count
+grows, that every case verifies, and that streamed output bytes equal the
+previous clip-at-a-time algorithm exactly.
 
 ## Intentionally omitted capabilities
 

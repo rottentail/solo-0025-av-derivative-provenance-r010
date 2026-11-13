@@ -10,10 +10,10 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .application import MediaProvenanceApplication
-from .errors import ApplicationError, InternalFailure, ValidationFailure
+from .errors import ApplicationError, InternalFailure
 from .serialization import new_identifier
 from .transport import read_json_body, write_json
-from .validation import decode_media_payload
+from .transport.asset_upload import read_asset_upload
 
 
 LOGGER = logging.getLogger(__name__)
@@ -88,6 +88,21 @@ class RequestHandler(BaseHTTPRequestHandler):
             request_id=request_id,
         )
 
+    def _spool_upload(self) -> tuple[Any, Path, Any]:
+        """Spool a media upload body to disk while parsing it incrementally."""
+
+        spool_handle, spool_path = self.application.content_files.open_temporary()
+        try:
+            upload = read_asset_upload(self, spool_handle, spool_path)
+        except BaseException:
+            try:
+                spool_handle.close()
+            except OSError:
+                pass
+            self.application.content_files.discard_temporary(spool_path)
+            raise
+        return upload, spool_path, spool_handle
+
     def do_GET(self) -> None:  # noqa: N802
         request_id = self._request_id()
         path = self._path()
@@ -147,14 +162,18 @@ class RequestHandler(BaseHTTPRequestHandler):
         path = self._path()
         try:
             if path == "/v1/assets":
-                body = read_json_body(self)
-                if body is None:
-                    raise ValidationFailure("A JSON body is required.")
-                data = decode_media_payload(body.get("data_base64"))
-                created = self.application.ingest_asset(
-                    body.get("filename"),
-                    data,
-                )
+                upload, spool_path, spool_handle = self._spool_upload()
+                try:
+                    created = self.application.ingest_asset_from_file(
+                        upload.filename,
+                        spool_path,
+                    )
+                finally:
+                    try:
+                        spool_handle.close()
+                    except OSError:
+                        pass
+                    self.application.content_files.discard_temporary(spool_path)
                 write_json(
                     self,
                     201,
